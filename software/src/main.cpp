@@ -1,6 +1,6 @@
 // SolderingStation2
 //
-// ATmega328-controlled Soldering Station for Hakko T12 Tips.
+// ATmega328-controlled Soldering Station for WMRT Tips.
 //
 // This version of the code implements:
 // - Temperature measurement of the tip
@@ -40,6 +40,9 @@
 // - TaaraLabs, https://github.com/TaaraLabs
 // - muink, https://github.com/muink
 //
+// 2023 by Vas
+// Project Files (Github):  https://github.com/banoz/ATmega-Soldering-Station
+//
 // 2019 - 2022 by Stefan Wagner
 // Project Files (EasyEDA): https://easyeda.com/wagiminator
 // Project Files (Github):  https://github.com/wagiminator
@@ -58,23 +61,25 @@
 #define VERSION "v2.0"
 
 // Type of MOSFET
-#define P_MOSFET // P_MOSFET or N_MOSFET
+#define N_MOSFET // P_MOSFET or N_MOSFET
 
 // Type of OLED Controller
 #define SSD1306 // SSD1306 or SH1106
 
 // Type of rotary encoder
-#define ROTARY_TYPE 0 // 0: 2 increments/step; 1: 4 increments/step (default)
+#define ROTARY_TYPE 1 // 0: 2 increments/step; 1: 4 increments/step (default)
 
 // Pins
 #define SENSOR_PIN A0  // tip temperature sense
 #define VIN_PIN A1     // input voltage sense
+#define COLDJ_PIN A6   // cold junction temperature sense
 #define BUZZER_PIN 5   // buzzer
 #define BUTTON_PIN 6   // rotary encoder switch
 #define ROTARY_1_PIN 7 // rotary encoder 1
 #define ROTARY_2_PIN 8 // rotary encoder 2
 #define CONTROL_PIN 9  // heater MOSFET PWM control
-#define SWITCH_PIN 10  // handle vibration switch
+#define REED_PIN A3    // handle reed switch
+#define REED_PU_PIN 4  // handle reed switch pull-up
 
 // Default temperature control values (recommended soldering temperature: 300-380°C)
 #define TEMP_MIN 150     // min selectable temperature
@@ -91,7 +96,7 @@
 #define TEMPCHP 30      // chip temperature while calibration
 #define TIPMAX 8        // max number of tips
 #define TIPNAMELENGTH 6 // max length of tip names (including termination)
-#define TIPNAME "BC1.5" // default tip name
+#define TIPNAME "WMRT"  // default tip name
 
 // Default timer values (0 = disabled)
 #define TIME2SLEEP 5   // time to enter sleep mode in minutes
@@ -114,11 +119,11 @@
 #if defined(P_MOSFET) // P-Channel MOSFET
 #define HEATER_ON 255
 #define HEATER_OFF 0
-#define HEATER_PWM 255 - Output
+#define HEATER_PWM Output
 #elif defined(N_MOSFET) // N-Channel MOSFET
 #define HEATER_ON 0
 #define HEATER_OFF 255
-#define HEATER_PWM Output
+#define HEATER_PWM 255 - Output
 #else
 #error Wrong MOSFET type!
 #endif
@@ -179,23 +184,22 @@ const char *MaxTipMessage[] = {"Warning", "You reached", "maximum number", "of t
 volatile uint8_t a0, b0, c0, d0;
 volatile bool ab0;
 volatile int count, countMin, countMax, countStep;
-volatile bool handleMoved;
 
 // Variables for temperature control
-uint16_t SetTemp, ShowTemp, gap, Step;
-double Input, Output, Setpoint, RawTemp, CurrentTemp, ChipTemp;
+uint16_t SetTemp, ShowTemp, Step;
+double Input, Output, Setpoint, RawTemp, CurrentTemp, ChipTemp, CJTemp;
 
 // Variables for voltage readings
 uint16_t Vcc, Vin;
 
 // State variables
-bool inSleepMode = false;
-bool inOffMode = false;
-bool inBoostMode = false;
-bool inCalibMode = false;
-bool isWorky = true;
-bool beepIfWorky = true;
-bool TipIsPresent = true;
+volatile bool inSleepMode = false;
+volatile bool inOffMode = false;
+volatile bool inBoostMode = false;
+volatile bool inCalibMode = false;
+volatile bool isWorky = true;
+volatile bool beepIfWorky = true;
+volatile bool TipIsPresent = true;
 
 // Timing variables
 uint32_t sleepmillis;
@@ -206,11 +210,10 @@ uint8_t goneSeconds;
 uint8_t SensorCounter = 255;
 
 // Specify variable pointers and initial PID tuning parameters
-PID ctrl(&Input, &Output, &Setpoint, aggKp, aggKi, aggKd, REVERSE);
+PID ctrl(&Input, &Output, &Setpoint, aggKp, aggKi, aggKd, P_ON_E, DIRECT);
 
 // Setup u8g object depending on OLED controller
 #if defined(SSD1306)
-
 U8G2_SSD1306_128X64_NONAME_1_HW_I2C u8g(U8G2_R0, 255, 5, 4); // U8G_I2C_OPT_DEV_0|U8G_I2C_OPT_NO_ACK|U8G_I2C_OPT_FAST);
 #elif defined(SH1106)
 U8GLIB_SH1106_128X64 u8g(U8G_I2C_OPT_FAST | U8G_I2C_OPT_NO_ACK);
@@ -226,6 +229,7 @@ void ChangeTipScreen();
 void DeleteTipScreen();
 uint16_t denoiseAnalog(byte);
 double getChipTemp();
+uint16_t getColdJ();
 void getEEPROM();
 int getRotary();
 uint16_t getVCC();
@@ -253,16 +257,18 @@ void setup()
   // set the pin modes
   pinMode(SENSOR_PIN, INPUT);
   pinMode(VIN_PIN, INPUT);
+  pinMode(COLDJ_PIN, INPUT);
   pinMode(BUZZER_PIN, OUTPUT);
   pinMode(CONTROL_PIN, OUTPUT);
-  pinMode(ROTARY_1_PIN, INPUT_PULLUP);
-  pinMode(ROTARY_2_PIN, INPUT_PULLUP);
-  pinMode(BUTTON_PIN, INPUT_PULLUP);
-  pinMode(SWITCH_PIN, INPUT_PULLUP);
+  pinMode(ROTARY_1_PIN, INPUT);
+  pinMode(ROTARY_2_PIN, INPUT);
+  pinMode(BUTTON_PIN, INPUT);
+  pinMode(REED_PIN, INPUT);
+  pinMode(REED_PU_PIN, INPUT);
 
   analogWrite(CONTROL_PIN, HEATER_OFF); // this shuts off the heater
   digitalWrite(BUZZER_PIN, LOW);        // must be LOW when buzzer not in use
-beep();
+
   // setup ADC
   ADCSRA |= bit(ADPS0) | bit(ADPS1) | bit(ADPS2); // set ADC prescaler to 128
   ADCSRA |= bit(ADIE);                            // enable ADC interrupt
@@ -272,7 +278,7 @@ beep();
   PCMSK0 = bit(PCINT0); // Configure pin change interrupt on Pin8
   PCICR = bit(PCIE0);   // Enable pin change interrupt
   PCIFR = bit(PCIF0);   // Clear interrupt flag
-beep();
+
   // prepare and start OLED
   u8g.begin();
 
@@ -285,16 +291,13 @@ beep();
   // read supply voltages in mV
   Vcc = getVCC();
   Vin = getVIN();
+  CJTemp = getColdJ();
 
   // read and set current iron temperature
   SetTemp = DefaultTemp;
   RawTemp = denoiseAnalog(SENSOR_PIN);
   ChipTemp = getChipTemp();
   calculateTemp();
-
-  // turn on heater if iron temperature is well below setpoint
-  if ((CurrentTemp + 20) < DefaultTemp)
-    analogWrite(CONTROL_PIN, HEATER_ON);
 
   // set PID output range and start the PID
   ctrl.SetOutputLimits(0, 255);
@@ -317,7 +320,6 @@ beep();
 void loop()
 {
   ROTARYCheck(); // check rotary encoder (temp/boost setting, enter setup menu)
-  SLEEPCheck();  // check and activate/deactivate sleep modes
   SENSORCheck(); // reads temperature and vibration switch of the iron
   Thermostat();  // heater control
   MainScreen();  // updates the main page on the OLED
@@ -344,7 +346,6 @@ void ROTARYCheck()
       inBoostMode = !inBoostMode;
       if (inBoostMode)
         boostmillis = millis();
-      handleMoved = true;
     }
   }
   c0 = c;
@@ -365,32 +366,29 @@ void ROTARYCheck()
 // check and activate/deactivate sleep modes
 void SLEEPCheck()
 {
-  if (handleMoved)
-  { // if handle was moved
-    if (inSleepMode)
-    {                                        // in sleep or off mode?
-      if ((CurrentTemp + 20) < SetTemp)      // if temp is well below setpoint
-        analogWrite(CONTROL_PIN, HEATER_ON); // then start the heater right now
-      beep();                                // beep on wake-up
-      beepIfWorky = true;                    // beep again when working temperature is reached
-    }
-    handleMoved = false;    // reset handleMoved flag
-    inSleepMode = false;    // reset sleep flag
-    inOffMode = false;      // reset off flag
-    sleepmillis = millis(); // reset sleep timer
-  }
+  pinMode(REED_PU_PIN, OUTPUT);
+  digitalWrite(REED_PU_PIN, HIGH);
+  uint16_t reedValue = denoiseAnalog(REED_PIN);
+  digitalWrite(REED_PU_PIN, LOW);
+  pinMode(REED_PU_PIN, INPUT);
 
-  // check time passed since the handle was moved
-  goneMinutes = (millis() - sleepmillis) / 60000;
-  if ((!inSleepMode) && (time2sleep > 0) && (goneMinutes >= time2sleep))
+  if (reedValue < 32u) // in stand
   {
+    TipIsPresent = true;
     inSleepMode = true;
-    beep();
+    inOffMode = false;
   }
-  if ((!inOffMode) && (time2off > 0) && (goneMinutes >= time2off))
+  else if (reedValue < 192u) // WMRP - 1k
   {
+    TipIsPresent = true;
+    inSleepMode = false;
+    inOffMode = false;
+  }
+  else // no tip
+  {
+    TipIsPresent = false;
+    inSleepMode = true;
     inOffMode = true;
-    beep();
   }
 }
 
@@ -398,22 +396,23 @@ void SLEEPCheck()
 void SENSORCheck()
 {
   analogWrite(CONTROL_PIN, HEATER_OFF); // shut off heater in order to measure temperature
+  SLEEPCheck();                         // check and activate/deactivate sleep modes
   delayMicroseconds(TIME2SETTLE);       // wait for voltage to settle
 
-  double temp = denoiseAnalog(SENSOR_PIN); // read ADC value for temperature
-  uint8_t d = digitalRead(SWITCH_PIN);     // check handle vibration switch
-  if (d != d0)
-  {
-    handleMoved = true;
-    d0 = d;
-  } // set flag if handle was moved
+  uint16_t temp = denoiseAnalog(SENSOR_PIN); // read ADC value for temperature
+
   if (!SensorCounter--)
+  {
+    CJTemp = getColdJ();
     Vin = getVIN(); // get Vin every now and then
+  }
 
-  analogWrite(CONTROL_PIN, HEATER_PWM); // turn on again heater
+  if (Vin > 11000) //todo
+    analogWrite(CONTROL_PIN, HEATER_PWM); // turn on again heater
 
-  RawTemp += (temp - RawTemp) * SMOOTHIE; // stabilize ADC temperature reading
-  calculateTemp();                        // calculate real temperature value
+  RawTemp += (temp - RawTemp); //todo * SMOOTHIE; // stabilize ADC temperature reading
+
+  calculateTemp(); // calculate real temperature value
 
   // stabilize displayed temperature when around setpoint
   if ((ShowTemp != Setpoint) || (abs(ShowTemp - CurrentTemp) > 5))
@@ -422,7 +421,7 @@ void SENSORCheck()
     ShowTemp = Setpoint;
 
   // set state variable if temperature is in working range; beep if working temperature was just reached
-  gap = abs(SetTemp - CurrentTemp);
+  uint16_t gap = abs(SetTemp - CurrentTemp);
   if (gap < 5)
   {
     if (!isWorky && beepIfWorky)
@@ -434,7 +433,12 @@ void SENSORCheck()
     isWorky = false;
 
   // checks if tip is present or currently inserted
-  if (ShowTemp > 500)
+  while (ShowTemp > 500)
+  {
+    analogWrite(CONTROL_PIN, HEATER_OFF); // shut off heater
+    beep();
+  }
+  /* todo
     TipIsPresent = false; // tip removed ?
   if (!TipIsPresent && (ShowTemp < 500))
   {                                                    // new tip inserted ?
@@ -448,11 +452,15 @@ void SENSORCheck()
     c0 = LOW;                                          // switch must be released
     setRotary(TEMP_MIN, TEMP_MAX, TEMP_STEP, SetTemp); // reset rotary encoder
   }
+  */
 }
 
 // calculates real temperature value according to ADC reading and calibration values
 void calculateTemp()
 {
+  CurrentTemp = RawTemp * 0.836 + 8.91 + (CJTemp - 25);
+  return; //todo
+
   if (RawTemp < 200)
     CurrentTemp = map(RawTemp, 0, 200, 21, CalTemp[CurrentTip][0]);
   else if (RawTemp < 280)
@@ -475,10 +483,11 @@ void Thermostat()
     Setpoint = SetTemp;
 
   // control the heater (PID or direct)
-  gap = abs(Setpoint - CurrentTemp);
+
   if (PIDenable)
   {
     Input = CurrentTemp;
+    uint16_t gap = abs(Setpoint - CurrentTemp);
     if (gap < 30)
       ctrl.SetTunings(consKp, consKi, consKd);
     else
@@ -488,12 +497,21 @@ void Thermostat()
   else
   {
     // turn on heater if current temperature is below setpoint
-    if ((CurrentTemp + 0.5) < Setpoint)
-      Output = 0;
-    else
+
+    if ((CurrentTemp + 50) < Setpoint)
       Output = 255;
+    else if ((CurrentTemp + 25) < Setpoint)
+      Output = 128;
+    else if ((CurrentTemp + 5) < Setpoint)
+      Output = 32;
+    else if ((CurrentTemp + 0.5) < Setpoint)
+      Output = 8;
+    else
+      Output = 0;
   }
-  analogWrite(CONTROL_PIN, HEATER_PWM); // set heater PWM
+
+  if (Vin > 11000) //todo
+    analogWrite(CONTROL_PIN, HEATER_PWM); // set heater PWM
 }
 
 // creates a short beep on the buzzer
@@ -651,7 +669,7 @@ void MainScreen()
       u8g.setFont(u8g2_font_freedoomr25_tn);
       u8g.setFontPosTop();
       u8g.setCursor(37, 22);
-      if (ShowTemp > 500)
+      if (false && ShowTemp > 500)
         u8g.print(F("000"));
       else
         u8g.print(ShowTemp);
@@ -719,7 +737,6 @@ void SetupScreen()
     }
   }
   updateEEPROM();
-  handleMoved = true;
   SetTemp = SaveSetTemp;
   setRotary(TEMP_MIN, TEMP_MAX, TEMP_STEP, SetTemp);
 }
@@ -1235,6 +1252,12 @@ uint16_t getVIN()
   return (result * Vcc / 179.474); // 179.474 = 1023 * R13 / (R12 + R13)
 }
 
+uint16_t getColdJ()
+{
+  uint16_t result = denoiseAnalog(COLDJ_PIN);
+  return (result * 0.9 - 113.836);
+}
+
 // ADC interrupt service routine
 EMPTY_INTERRUPT(ADC_vect); // nothing to be done here
 
@@ -1256,7 +1279,6 @@ ISR(PCINT0_vect)
         count = constrain(count + ((a == b) ? countStep : -countStep), countMin, countMax);
       }
       ab0 = (a == b);
-      handleMoved = true;
     }
   }
 }
